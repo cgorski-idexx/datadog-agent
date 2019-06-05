@@ -364,6 +364,10 @@ FROM [Blogs] AS [b
 ORDER BY [b].[Name]`,
 			`Non-parsable SQL query`,
 		},
+		{
+			" SELECT Codi, Nom_ES, Nom_CA, ContaComExamen FROM ProtTipusRec with (NoLock) ",
+			"SELECT Codi, Nom_ES, Nom_CA, ContaComExamen FROM ProtTipusRec with ( NoLock )",
+		},
 	}
 
 	for i, c := range cases {
