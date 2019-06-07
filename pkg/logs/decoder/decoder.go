@@ -45,9 +45,9 @@ func NewOutput(content []byte, status string, rawDataLen int, timestamp string) 
 
 // Decoder splits raw data into lines and passes them to a lineHandler that emits outputs
 type Decoder struct {
-	InputChan  chan *Input
-	OutputChan chan *Output
-	EndLineMatcher
+	InputChan       chan *Input
+	OutputChan      chan *Output
+	matcher         EndLineMatcher
 	lineBuffer      *bytes.Buffer
 	lineHandler     LineHandler
 	contentLenLimit int
@@ -85,7 +85,7 @@ func New(InputChan chan *Input, OutputChan chan *Output, lineHandler LineHandler
 		lineBuffer:      &lineBuffer,
 		lineHandler:     lineHandler,
 		contentLenLimit: contentLenLimit,
-		EndLineMatcher:  matcher,
+		matcher:         matcher,
 	}
 }
 
@@ -122,7 +122,7 @@ func (d *Decoder) decodeIncomingData(inBuf []byte) {
 			d.sendLine()
 			i = j
 			maxj = i + d.contentLenLimit
-		} else if d.Match(d.lineBuffer.Bytes(), inBuf, i, j) {
+		} else if d.matcher.Match(d.lineBuffer.Bytes(), inBuf, i, j) {
 			d.lineBuffer.Write(inBuf[i:j])
 			d.sendLine()
 			i = j + 1 // skip the matching byte.
