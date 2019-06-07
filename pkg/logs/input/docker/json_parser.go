@@ -42,7 +42,7 @@ func (p *jsonParser) Parse(data []byte) ([]byte, string, string, error) {
 	var log *logLine
 	err := json.Unmarshal(data, &log)
 	if err != nil {
-		return data, message.StatusInfo, "", fmt.Errorf("could not parse JSON container line: %v", err)
+		return data, message.StatusInfo, "", fmt.Errorf("cannot parse docker message, invalid JSON: %v", err)
 	}
 	var status string
 	switch log.Stream {
