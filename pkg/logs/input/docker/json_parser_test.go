@@ -37,6 +37,8 @@ func TestJSONParser(t *testing.T) {
 	assert.Equal(t, message.StatusInfo, status)
 	assert.Equal(t, "2019-06-06T16:35:55.930852911Z", timestamp)
 
-	_, _, _, err = parser.Parse([]byte(`a wrong message`))
+	content, status, _, err = parser.Parse([]byte("a wrong message"))
 	assert.NotNil(t, err)
+	assert.Equal(t, []byte("a wrong message"), content)
+	assert.Equal(t, message.StatusInfo, status)
 }
