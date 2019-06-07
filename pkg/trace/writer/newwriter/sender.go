@@ -1,145 +1,214 @@
 package writer
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/trace/info"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 var errRetryLater = errors.New("request can not be completed, try again later")
 
 type payload struct {
-	header map[string]string
-	body   io.Reader
+	body    []byte
+	headers map[string]string
 }
 
-func newPayload(body io.Reader, headers map[string]string) *payload {
-	p := payload{
-		body:   body,
-		header: headers,
+func (p *payload) httpRequest(url string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(p.body))
+	if err != nil {
+		// this should never happen with sanitized data (invalid method or invalid url)
+		return nil, err
 	}
+	for k, v := range p.headers {
+		req.Header.Add(k, v)
+	}
+	return req, nil
+}
+
+func newPayload(body []byte, headers map[string]string) *payload {
+	p := payload{
+		body:    body,
+		headers: headers,
+	}
+	if p.headers == nil {
+		p.headers = make(map[string]string, 1)
+	}
+	p.headers["Content-Length"] = strconv.Itoa(len(body))
 	return &p
 }
+
+var maxQueueSize = 64 * 1024 * 1024 // 64MB; replaced in tests
 
 type sender struct {
 	client *http.Client
 	url    string
+	apiKey string
+	wg     sync.WaitGroup
+	sema   chan struct{} // semaphore for limiting goroutines
 
-	mu         sync.RWMutex // guards below group
-	retryQueue *list.List   // *http.Request's queued for retrying
-	retry      int          // next retry number (0=off, 1=first)
+	mu        sync.Mutex // guards below fields
+	list      *list.List // send queue
+	size      int        // size of send queue
+	attempt   int        // retry attempt following
+	scheduled bool       // flush scheduled; TODO(gbbr): scheduled == q.list.Len() > 0 ? if yes, remove it
+	timer     *time.Timer
 }
 
-func newSender(client *http.Client, url string) *sender {
-	s := sender{
-		url:        url,
-		client:     client,
-		retryQueue: list.New(),
+func newSender(client *http.Client, url, apiKey string) *sender {
+	return &sender{
+		client: client,
+		url:    url,
+		sema:   make(chan struct{}, 200),
+		list:   list.New(),
+		apiKey: apiKey,
 	}
-	return &s
 }
 
-func (s *sender) flush() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (q *sender) Push(p *payload) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
+	q.enqueueLocked(p)
+	if !q.scheduled {
+		q.sema <- struct{}{}
+		q.scheduled = true
+		q.wg.Add(1)
+		go func() {
+			q.flush()
+			<-q.sema
+		}()
+	}
+}
+
+func (q *sender) drainQueue() []*payload {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var payloads []*payload
+	for q.list.Len() > 0 {
+		v := q.list.Remove(q.list.Front())
+		payloads = append(payloads, v.(*payload))
+	}
+	q.size = 0
+	return payloads
+}
+
+func (q *sender) sendQueue() (failed uint64) {
 	var wg sync.WaitGroup
-	done := make(chan *list.Element, s.retryQueue.Len())
+	payloads := q.drainQueue()
 	ctx, cancel := context.WithCancel(context.Background())
-
-	for e := s.retryQueue.Front(); e != nil; e = e.Next() {
+	defer cancel() // avoid leaks
+	for _, p := range payloads {
+		q.sema <- struct{}{}
 		wg.Add(1)
-		// we try flushing payloads concurrently
-		go func(e *list.Element) {
+		go func(p *payload) {
 			defer wg.Done()
-			req := e.Value.(*http.Request)
-			switch err := s.do(req.WithContext(ctx)); err {
+			defer func() { <-q.sema }()
+			req, err := p.httpRequest(q.url)
+			if err != nil {
+				log.Errorf("Error creating http.Request: %s", err)
+				return
+			}
+			switch err := q.do(req.WithContext(ctx)); err {
 			case nil:
-				done <- e
+				// OK
 			case errRetryLater:
-				// cancel any pending requests, we need to start backing off
+				// postpone any requests in progress and try again later
 				cancel()
+				q.enqueue(p)
+				atomic.AddUint64(&failed, 1)
 			default:
-				if uerr := err.(*url.Error); uerr.Err == context.Canceled {
-					// canceled, will try again next time
-					return
+				if uerr, ok := err.(*url.Error); ok && uerr.Err == context.Canceled {
+					// postponed
+					q.enqueue(p)
+				} else {
+					// not retriable
+					log.Errorf("Error sending payload: %v", err)
 				}
-				done <- e
-				log.Errorf("Error sending payload: %v", err)
 			}
-		}(e)
+		}(p)
 	}
-
 	wg.Wait()
-outer:
-	for {
-		select {
-		case e := <-done:
-			s.retryQueue.Remove(e)
-		default:
-			break outer
-		}
+	return failed
+}
+
+func (q *sender) flush() {
+	defer q.wg.Done()
+	failed := q.sendQueue()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if failed > 0 {
+		// some requests failed, backoff
+		q.attempt++
+		q.scheduled = true
+		q.timer = time.AfterFunc(backoffDuration(q.attempt), func() {
+			q.wg.Add(1)
+			q.flush()
+		})
+		return
 	}
-	switch s.retryQueue.Len() {
-	case 0:
-		// everything was sent
-		s.retry = 0
-	default:
-		// we need to continue backing off
-		s.retry++
-		defer time.AfterFunc(fullJitterDuration(s.retry), s.flush)
+	// all succeeded
+	q.attempt = 0
+	q.scheduled = false
+	if q.list.Len() > 0 {
+		// some items came in while flushing
+		q.scheduled = true
+		q.wg.Add(1)
+		q.sema <- struct{}{}
+		go func() {
+			q.flush()
+			<-q.sema
+		}()
 	}
 }
 
-func (s *sender) send(p *payload) {
-	req, err := http.NewRequest(http.MethodPost, s.url, p.body)
-	if err != nil {
-		// this should never happen with sanitized data (invalid method or invalid url)
-		log.Errorf("http.NewRequest: %s", err)
-		return
+func (q *sender) Flush() {
+	q.mu.Lock()
+	if q.timer != nil {
+		fmt.Println(q.timer.Stop())
 	}
-	for k, v := range p.header {
-		req.Header.Add(k, v)
-	}
-	s.mu.RLock()
-	backoff := s.retry > 0
-	s.mu.RUnlock()
-	if backoff {
-		// we are backing off for now, push into the queue
-		s.mu.Lock()
-		s.retryQueue.PushBack(req)
-		s.mu.Unlock()
-		return
-	}
-	go func() {
-		switch err := s.do(req); err {
-		case nil:
-			return
-		case errRetryLater:
-			s.mu.Lock()
-			s.retryQueue.PushBack(req)
-			if s.retry == 0 {
-				// this is the first retriable failure, schedule a retry
-				s.retry++
-				time.AfterFunc(fullJitterDuration(s.retry), s.flush)
-			}
-			s.mu.Unlock()
-		default:
-			log.Errorf("Error sending payload: %s", err)
-		}
-	}()
+	q.mu.Unlock()
+	q.wg.Wait()
+	q.sendQueue()
 }
 
-func (s *sender) do(req *http.Request) error {
-	resp, err := s.client.Do(req)
+func (q *sender) enqueue(p *payload) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.enqueueLocked(p)
+}
+
+func (q *sender) enqueueLocked(p *payload) {
+	size := len(p.body)
+	for q.size+size > maxQueueSize {
+		// make room
+		v := q.list.Remove(q.list.Front())
+		q.size -= len(v.(*payload).body)
+		// TODO: log and metric
+	}
+	q.list.PushBack(p)
+	q.size += size
+}
+
+// userAgent is the computed user agent we'll use when communicating with Datadog
+var userAgent = fmt.Sprintf("Datadog Trace Agent/%s/%s", info.Version, info.GitCommit)
+
+func (q *sender) do(req *http.Request) error {
+	req.Header.Set("DD-Api-Key", q.apiKey)
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := q.client.Do(req)
 	if err != nil {
 		// request errors are either redirect errors or url errors
 		return errRetryLater
@@ -156,16 +225,20 @@ func (s *sender) do(req *http.Request) error {
 }
 
 const (
-	base        = 200 * time.Millisecond
-	maxDuration = 30 * time.Second
+	base        = 100 * time.Millisecond
+	maxDuration = 10 * time.Second
 )
 
-// fullJitter implements Full Jitter Backoff as per https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
-func fullJitterDuration(n int) time.Duration {
-	pow := math.Min(math.Pow(2, float64(n)), math.MaxInt64)
-	ns := math.Min(float64(base)*pow, math.MaxInt64)
-	if ns > float64(maxDuration) {
-		return maxDuration
+// backoffDuration returns the backoff duration necessary for the given attempt.
+// https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+var backoffDuration = func(attempt int) time.Duration {
+	if attempt == 0 {
+		return 0
 	}
-	return time.Duration(ns)
+	pow := math.Min(math.Pow(2, float64(attempt)), math.MaxInt64)
+	ns := int64(math.Min(float64(base)*pow, math.MaxInt64))
+	if ns > int64(maxDuration) {
+		ns = int64(maxDuration)
+	}
+	return time.Duration(rand.Int63n(ns))
 }

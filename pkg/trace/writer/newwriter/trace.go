@@ -133,12 +133,12 @@ func (w *TraceWriter) flush() {
 	gzipw.Write(b)
 	gzipw.Close()
 
-	req := newPayload(&buf, map[string]string{
+	req := newPayload(buf.Bytes(), map[string]string{
 		"Content-Type":     "application/x-protobuf",
 		"Content-Encoding": "gzip",
 		headerLanguages:    strings.Join(info.Languages(), "|"),
 	})
 	for _, sender := range w.senders {
-		sender.send(req)
+		sender.Push(req)
 	}
 }
